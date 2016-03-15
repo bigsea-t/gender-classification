@@ -51,28 +51,24 @@ class GenderModel(object):
                   for input_ in tf.split(1, num_steps, inputs)]
         outputs, state = tf.models.rnn.rnn.rnn(cell, inputs, initial_state=self._initial_state)
 
-        # hidden size == input size
-        # len_inputs == num_steps == num_outputs
-
-        print('vocab size', vocab_size)
-        print('size', size)
-        print('num_steps', num_steps)
-        print('len inputs', len(inputs))
-        print('inputs[0]', inputs[0])
-        print('batch_size', batch_size)
-        print('hidden states', size)
-        print('len_outputs', len(outputs))
-        print('output[0]', outputs[0])
-
-        print(tf.pack(outputs))
-        pooled = tf.reduce_mean(tf.pack(outputs), 0, name='pooling')
-        print(pooled)
+        pooled = tf.reduce_max(tf.pack(outputs), 0, name='pooling')
 
         softmax_w = tf.get_variable("softmax_w", [size, num_classes])
         softmax_b = tf.get_variable("softmax_b", [num_classes])
+        # y = tf.nn.softmax(tf.matmul(pooled, softmax_w) + softmax_b, "y")
         logits = tf.matmul(pooled, softmax_w) + softmax_b
         loss = tf.nn.softmax_cross_entropy_with_logits(logits, self._targets)
         self._cost = cost = tf.reduce_mean(loss)
+
+        # self._cost = cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logit, self._targets))
+        tf.scalar_summary("xentropy", cost)
+
+        # correct_prediction = tf.equal(tf.argmax(y, 1), tf.argmax(self._targets, 1))
+        # self._accuracy = accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
+        # accuracy_summary = tf.scalar_summary("accuracy", accuracy)
+
+        self._summary = tf.merge_all_summaries()
+
         self._final_state = state
 
         if not is_training:
@@ -84,6 +80,7 @@ class GenderModel(object):
                                           config.max_grad_norm)
         optimizer = tf.train.GradientDescentOptimizer(self.lr)
         self._train_op = optimizer.apply_gradients(zip(grads, tvars))
+
 
     def assign_lr(self, session, lr_value):
         session.run(tf.assign(self.lr, lr_value))
@@ -116,20 +113,28 @@ class GenderModel(object):
     def train_op(self):
         return self._train_op
 
+    # @property
+    # def accuracy(self):
+    #     return self._accuracy
+
+    @property
+    def summary(self):
+        return self._summary
+
 
 class SmallConfig(object):
     """Small config."""
     init_scale = 0.1
     learning_rate = 1.0
     max_grad_norm = 5
-    num_layers = 2
-    num_steps = 20
+    num_layers = 1
+    num_steps = 40 #200 # should be same as max_len of words
     hidden_size = 200
-    max_epoch = 4
-    max_max_epoch = 13
+    max_epoch = 1 #4
+    max_max_epoch = 2 #13
     keep_prob = 1.0
     lr_decay = 0.5
-    batch_size = 11 #20
+    batch_size = 20
     # vocab_size = 10000
     vocab_size = 89972
     n_classes = 2
@@ -185,29 +190,33 @@ class TestConfig(object):
 
 def run_epoch(session, m, data, eval_op, verbose=False):
     """Runs the model on the given data."""
-    epoch_size = ((len(data) // m.batch_size) - 1) // m.num_steps
-    start_time = time.time()
+    posts, labels = data
+    n_docs, n_words = posts.shape
+    epoch_size = n_docs // m.batch_size
     costs = 0.0
+    accs = 0.0
     iters = 0
     state = m.initial_state.eval()
     for step, (texts, label) in enumerate(reader.data_iterator(data, m.batch_size,
                                                       m.num_steps)):
-        print('texts', texts.shape, texts)
-        print('labels', label.shape, label)
-
-        cost, state, _ = session.run([m.cost, m.final_state, eval_op],
+        print('texts', texts.shape)
+        print('label', label.shape)
+        cost, state, _, summary = session.run([m.cost, m.final_state, eval_op, m.summary],
                                                                  {m.input_data: texts,
-                                                                    m.targets: label,
-                                                                    m.initial_state: state})
+                                                                     m.targets: label,
+                                                                     m.initial_state: state})
+        acc = 0
         costs += cost
-        iters += m.num_steps
+        accs += acc
+        iters += m.batch_size
 
-        if verbose and step % (epoch_size // 10) == 10:
-            print("%.3f perplexity: %.3f speed: %.0f wps" %
-                        (step * 1.0 / epoch_size, np.exp(costs / iters),
-                         iters * m.batch_size / (time.time() - start_time)))
+        if iters > 3:
+            return costs / iters, accs / iters, summary
+        if verbose and step % (epoch_size // 10) == 0:
+            print("%.3f xentropy: %.3f " %
+                  (step * 1.0 / epoch_size, costs / iters))
 
-    return np.exp(costs / iters)
+    return costs / iters, accs / iters, summary
 
 
 def get_config():
@@ -227,16 +236,18 @@ def main(_):
     if not FLAGS.data_path:
         raise ValueError("Must set --data_path to data directory")
 
-    raw_data = reader.converted_data(FLAGS.data_path, max_len=6960)
-
-    train_data, valid_data, test_data = reader.split_rawdata(raw_data)
-
-    print('td', train_data[0].shape)
-
     config = get_config()
     eval_config = get_config()
     eval_config.batch_size = 1
-    eval_config.num_steps = 1
+    # eval_config.num_steps = 1
+
+    raw_data = reader.converted_data(FLAGS.data_path, max_len=config.num_steps, min_nwords=200)
+
+    train_data, valid_data, test_data = reader.split_rawdata(raw_data)
+
+
+    sess = tf.InteractiveSession()
+    writer = tf.train.SummaryWriter("/tmp/mnist_logs", sess.graph_def)
 
     with tf.Graph().as_default(), tf.Session() as session:
         initializer = tf.random_uniform_initializer(-config.init_scale,
@@ -254,14 +265,16 @@ def main(_):
             m.assign_lr(session, config.learning_rate * lr_decay)
 
             print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-            train_perplexity = run_epoch(session, m, train_data, m.train_op,
-                                                                     verbose=True)
-            print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-            valid_perplexity = run_epoch(session, mvalid, valid_data, tf.no_op())
-            print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+            train_error, train_acc, summary = run_epoch(session, m, train_data, m.train_op, verbose=True)
+            writer.add_summary(summary, i)
+            print("Epoch: %d Train Error: %.3f" % (i + 1, train_error))
 
-        test_perplexity = run_epoch(session, mtest, test_data, tf.no_op())
-        print("Test Perplexity: %.3f" % test_perplexity)
+            valid_error, valid_acc, summary = run_epoch(session, mvalid, valid_data, tf.no_op())
+            writer.add_summary(summary, i)
+            print("Epoch: %d Valid Error: %.3f" % (i + 1, valid_error))
+
+        test_err, test_acc, summary = run_epoch(session, mtest, test_data, tf.no_op())
+        print("Test Accuracy %.3f", test_acc)
 
 
 if __name__ == "__main__":

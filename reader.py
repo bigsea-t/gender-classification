@@ -25,16 +25,14 @@ def string_processing(str):
     return str
 
 
-def build_vocab(posts):
+def build_vocab(posts, min_appear=5):
     flattened = [word for post in posts for word in post]
     counter = collections.Counter(flattened)
 
     count_pairs = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
 
     words, _ = list(zip(*count_pairs))
-    word_to_id = dict(zip(words, range(len(words))))
-
-    print('vocab_size:', len(words))
+    word_to_id = {k:v if counter[k] >= min_appear else len(words) for k, v in zip(words, range(len(words)))}
 
     return word_to_id
 
@@ -65,7 +63,12 @@ def converted_data(data_dir, min_nwords=200, max_len=None):
 
     word_to_id = build_vocab(padded_posts)
 
-    id_posts = np.array([[word_to_id[word] for word in post] for post in padded_posts], dtype=np.int32)
+    id_posts = [[word_to_id[word] for word in post] for post in padded_posts]
+
+    print('vocab size:', len(collections.Counter([w for p in id_posts for w in p])))
+
+    id_posts = np.array(id_posts, dtype=np.int32)
+
     labels = np.array(labels)
 
     bin_labels = np.zeros((labels.shape[0], 2))
@@ -113,6 +116,7 @@ def data_iterator(data, batch_size, num_steps):
 
     len_batch = num_posts // batch_size
     len_step = len_post // num_steps
+
 
     if len_batch < 1:
         raise ValueError("batch_size must be <= num posts")
