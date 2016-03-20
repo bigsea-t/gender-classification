@@ -4,11 +4,14 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.models.rnn
 import reader
+import os
+import shutil
 
 flags = tf.flags
 logging = tf.logging
 
 flags.DEFINE_string("data_path", None, "data_path")
+flags.DEFINE_string("log_dir", "/tmp/gender_rnn_logs", "log_dir")
 flags.DEFINE_string(
     "model", "small",
     "A type of model. Possible options are: small, medium, large.")
@@ -25,6 +28,7 @@ class GenderModel(object):
         size = config.hidden_size
         vocab_size = config.vocab_size
         num_classes = config.n_classes
+        dc_dim = config.dc_dim
 
         self._input_data = tf.placeholder(tf.int32, [batch_size, num_steps])
         self._targets = tf.placeholder(tf.float32, [batch_size, num_classes])
@@ -53,23 +57,41 @@ class GenderModel(object):
 
         pooled = tf.reduce_max(tf.pack(outputs), 0, name='pooling')
 
-        softmax_w = tf.get_variable("softmax_w", [size, num_classes])
+        dc_w = tf.get_variable("dc_w", [size, dc_dim])
+        dc_b = tf.get_variable("dc_b", [dc_dim])
+
+        dc = tf.nn.tanh(tf.matmul(pooled, dc_w) + dc_b, "dc_layer")
+
+        if is_training and config.keep_prob < 1:
+            dc = tf.nn.dropout(dc, config.keep_prob)
+
+        softmax_w = tf.get_variable("softmax_w", [dc_dim, num_classes])
         softmax_b = tf.get_variable("softmax_b", [num_classes])
-        # y = tf.nn.softmax(tf.matmul(pooled, softmax_w) + softmax_b, "y")
-        logits = tf.matmul(pooled, softmax_w) + softmax_b
-        loss = tf.nn.softmax_cross_entropy_with_logits(logits, self._targets)
-        self._cost = cost = tf.reduce_mean(loss)
 
-        # self._cost = cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logit, self._targets))
-        tf.scalar_summary("xentropy", cost)
+        y = tf.nn.softmax(tf.matmul(dc, softmax_w) + softmax_b, "y")
 
-        # correct_prediction = tf.equal(tf.argmax(y, 1), tf.argmax(self._targets, 1))
-        # self._accuracy = accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-        # accuracy_summary = tf.scalar_summary("accuracy", accuracy)
+        # if is_training and config.keep_prob < 1:
+        #     y = tf.nn.dropout(y, config.keep_prob)
 
-        self._summary = tf.merge_all_summaries()
+        w_hist = tf.histogram_summary("w", softmax_w)
+        b_hist = tf.histogram_summary("biases", softmax_b)
+        dc_w_hist = tf.histogram_summary("dc_w", dc_w)
+        dc_b_hist = tf.histogram_summary("dc_b", dc_b)
+        y_hist = tf.histogram_summary("y", y)
+        pooled_hist = tf.histogram_summary("pool", pooled)
+
+        wd_loss = tf.nn.l2_loss(dc_w) #tf.nn.l2_loss(softmax_w) +
+        self._cost = cost = tf.reduce_mean(-self._targets * tf.log(y)) + config.wd * wd_loss
+
+        correct_prediction = tf.equal(tf.argmax(y, 1), tf.argmax(self._targets, 1))
+        self._accuracy = accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
 
         self._final_state = state
+
+        xentropy_summary = tf.scalar_summary("xentropy", cost)
+        accuracy_summary = tf.scalar_summary("accuracy", accuracy)
+
+        self._summary = tf.merge_summary([xentropy_summary, accuracy_summary, w_hist, b_hist, y_hist, pooled_hist, dc_w_hist, dc_b_hist])
 
         if not is_training:
             return
@@ -80,7 +102,6 @@ class GenderModel(object):
                                           config.max_grad_norm)
         optimizer = tf.train.GradientDescentOptimizer(self.lr)
         self._train_op = optimizer.apply_gradients(zip(grads, tvars))
-
 
     def assign_lr(self, session, lr_value):
         session.run(tf.assign(self.lr, lr_value))
@@ -113,9 +134,9 @@ class GenderModel(object):
     def train_op(self):
         return self._train_op
 
-    # @property
-    # def accuracy(self):
-    #     return self._accuracy
+    @property
+    def accuracy(self):
+        return self._accuracy
 
     @property
     def summary(self):
@@ -126,19 +147,20 @@ class SmallConfig(object):
     """Small config."""
     init_scale = 0.1
     learning_rate = 1.0
-    max_grad_norm = 5
+    max_grad_norm = 3
     num_layers = 1
-    num_steps = 40 #200 # should be same as max_len of words
-    hidden_size = 200
-    max_epoch = 1 #4
-    max_max_epoch = 2 #13
-    keep_prob = 1.0
-    lr_decay = 0.5
-    batch_size = 20
-    # vocab_size = 10000
-    vocab_size = 89972
+    num_steps = 200 # should be same as max_len of words
+    hidden_size = 100
+    max_epoch = 80
+    max_max_epoch = 120
+    keep_prob = 0.5
+    lr_decay = 0.8
+    batch_size = 10
+    # vocab_size = None
+    # vocab_size = 89972
     n_classes = 2
-
+    dc_dim = 2
+    wd = 0.0001
 
 class MediumConfig(object):
     """Medium config."""
@@ -197,21 +219,17 @@ def run_epoch(session, m, data, eval_op, verbose=False):
     accs = 0.0
     iters = 0
     state = m.initial_state.eval()
+
     for step, (texts, label) in enumerate(reader.data_iterator(data, m.batch_size,
                                                       m.num_steps)):
-        print('texts', texts.shape)
-        print('label', label.shape)
-        cost, state, _, summary = session.run([m.cost, m.final_state, eval_op, m.summary],
+        cost, state, acc, summary, _ = session.run([m.cost, m.final_state, m.accuracy, m.summary, eval_op],
                                                                  {m.input_data: texts,
                                                                      m.targets: label,
                                                                      m.initial_state: state})
-        acc = 0
         costs += cost
         accs += acc
-        iters += m.batch_size
+        iters += 1
 
-        if iters > 3:
-            return costs / iters, accs / iters, summary
         if verbose and step % (epoch_size // 10) == 0:
             print("%.3f xentropy: %.3f " %
                   (step * 1.0 / epoch_size, costs / iters))
@@ -238,16 +256,20 @@ def main(_):
 
     config = get_config()
     eval_config = get_config()
-    eval_config.batch_size = 1
+    # eval_config.batch_size = 1
     # eval_config.num_steps = 1
 
-    raw_data = reader.converted_data(FLAGS.data_path, max_len=config.num_steps, min_nwords=200)
+    raw_data, vocab_size = reader.converted_data(FLAGS.data_path, max_len=config.num_steps, min_nwords=200)
+    config.vocab_size = vocab_size
+    eval_config.vocab_size = vocab_size
 
     train_data, valid_data, test_data = reader.split_rawdata(raw_data)
 
-
     sess = tf.InteractiveSession()
-    writer = tf.train.SummaryWriter("/tmp/mnist_logs", sess.graph_def)
+
+    if os.path.exists(FLAGS.log_dir):
+        shutil.rmtree(FLAGS.log_dir)
+    writer = tf.train.SummaryWriter(FLAGS.log_dir, sess.graph_def)
 
     with tf.Graph().as_default(), tf.Session() as session:
         initializer = tf.random_uniform_initializer(-config.init_scale,
@@ -267,14 +289,15 @@ def main(_):
             print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
             train_error, train_acc, summary = run_epoch(session, m, train_data, m.train_op, verbose=True)
             writer.add_summary(summary, i)
-            print("Epoch: %d Train Error: %.3f" % (i + 1, train_error))
+            print("Epoch: %d Train xentorpy: %.3f" % (i + 1, train_error))
+            print("Epoch: %d Train accuracy: %.3f" % (i + 1, train_acc))
 
             valid_error, valid_acc, summary = run_epoch(session, mvalid, valid_data, tf.no_op())
-            writer.add_summary(summary, i)
-            print("Epoch: %d Valid Error: %.3f" % (i + 1, valid_error))
+            print("Epoch: %d Validation xentropy: %.3f" % (i + 1, valid_error))
+            print("Epoch: %d Validation accuracy: %.3f" % (i + 1, valid_acc))
 
         test_err, test_acc, summary = run_epoch(session, mtest, test_data, tf.no_op())
-        print("Test Accuracy %.3f", test_acc)
+        print("Test Accuracy %.3f" % test_acc)
 
 
 if __name__ == "__main__":

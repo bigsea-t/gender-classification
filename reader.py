@@ -5,6 +5,7 @@ import csv
 import os
 import re
 import collections
+import random
 import itertools
 from sklearn import preprocessing
 
@@ -32,7 +33,7 @@ def build_vocab(posts, min_appear=5):
     count_pairs = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
 
     words, _ = list(zip(*count_pairs))
-    word_to_id = {k:v if counter[k] >= min_appear else len(words) for k, v in zip(words, range(len(words)))}
+    word_to_id = {k: v if counter[k] >= min_appear else 0 for k, v in zip(words, range(1, len(words)+1))}
 
     return word_to_id
 
@@ -65,7 +66,8 @@ def converted_data(data_dir, min_nwords=200, max_len=None):
 
     id_posts = [[word_to_id[word] for word in post] for post in padded_posts]
 
-    print('vocab size:', len(collections.Counter([w for p in id_posts for w in p])))
+    vocab_size = len(collections.Counter([w for p in id_posts for w in p])) + 1
+    print('vocab size:', vocab_size)
 
     id_posts = np.array(id_posts, dtype=np.int32)
 
@@ -75,12 +77,17 @@ def converted_data(data_dir, min_nwords=200, max_len=None):
     bin_labels[labels==0, 0] = 1
     bin_labels[labels==1, 1] = 1
 
-    return id_posts, bin_labels
+    return (id_posts, bin_labels), vocab_size
 
 
 def split_rawdata(raw_data, ratio=[.7, .1, .2]):
     posts, labels = raw_data
     n_data = len(labels)
+
+    zipped = list(zip(posts, labels))
+    random.shuffle(zipped)
+    posts = np.array([z[0] for z in zipped])
+    labels = np.array([z[1] for z in zipped])
 
     n_train = int(n_data * ratio[0])
     n_valid = int(n_data * ratio[1])
